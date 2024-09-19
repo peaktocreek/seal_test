@@ -1,0 +1,207 @@
+From 7e28b72b0ec7090587ce2c4ce667cd1394ecd504 Mon Sep 17 00:00:00 2001
+From: Jeff Xu <jeffxu@chromium.org>
+Date: Thu, 19 Sep 2024 00:45:47 +0000
+Subject: [RFC PATCH v1 2/2] exec: seal system mappings
+
+Seal vdso,vvar,sigpage,uprobes and vsyscall.
+
+Two ways to disable/enable this feature:
+KCONFIG: CONFIG_SEAL_SYSTEM_MAPPINGS_NEVER|ALWAYS
+kernel cmdline: exec.seal_system_mappings=never|always
+
+CHECKPOINT_RESTORE (CRIU) can call remap on vdso during restore,
+system that uses CRIU should use CONFIG_SEAL_SYSTEM_MAPPING_NEVER.
+
+uprobes's lifetime is same as process's lifetime [1], and is sealable.
+
+vsyscall is a special mapping, seal it when it is execute-only.
+
+[1] https://lore.kernel.org/all/CABi2SkU9BRUnqf70-nksuMCQ+yyiWjo3fM4XkRkL-NrCZxYAyg@mail.gmail.com/
+
+Signed-off-by: Jeff Xu <jeffxu@chromium.org>
+---
+ .../admin-guide/kernel-parameters.txt         |  8 +++
+ arch/x86/entry/vsyscall/vsyscall_64.c         |  9 +++-
+ fs/exec.c                                     | 52 +++++++++++++++++++
+ include/linux/fs.h                            |  2 +
+ mm/mmap.c                                     |  2 +
+ security/Kconfig                              | 24 +++++++++
+ 6 files changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index bc86b6a573f7..6614b176bc54 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1543,6 +1543,14 @@
+ 			- 'always': always seal NX Stack.
+ 			If not specified or invalid, default is the KCONFIG value.
+ 
++	exec.seal_system_mappings = [KNL]
++			Format: { never | always }
++			Seal system mappings such as vdso, vvar, sigpage, uprobes
++			This overwrites KCONFIG CONFIG_SEAL_SYSTEM_MAPPINGS_*
++			- 'never':  never seal system mappings.
++			- 'always': always seal system mappings.
++			If not specified or invalid, default is the KCONFIG value.
++
+ 	early_page_ext [KNL,EARLY] Enforces page_ext initialization to earlier
+ 			stages so cover more early boot allocations.
+ 			Please note that as side effect some optimizations
+diff --git a/arch/x86/entry/vsyscall/vsyscall_64.c b/arch/x86/entry/vsyscall/vsyscall_64.c
+index 2fb7d53cf333..20a3000550d2 100644
+--- a/arch/x86/entry/vsyscall/vsyscall_64.c
++++ b/arch/x86/entry/vsyscall/vsyscall_64.c
+@@ -32,6 +32,7 @@
+ #include <linux/mm_types.h>
+ #include <linux/syscalls.h>
+ #include <linux/ratelimit.h>
++#include <linux/fs.h>
+ 
+ #include <asm/vsyscall.h>
+ #include <asm/unistd.h>
+@@ -366,8 +367,12 @@ void __init map_vsyscall(void)
+ 		set_vsyscall_pgtable_user_bits(swapper_pg_dir);
+ 	}
+ 
+-	if (vsyscall_mode == XONLY)
+-		vm_flags_init(&gate_vma, VM_EXEC);
++	if (vsyscall_mode == XONLY) {
++		unsigned long vm_flags = VM_EXEC;
++
++		update_seal_exec_system_mappings(&vm_flags);
++		vm_flags_init(&gate_vma, vm_flags);
++	}
+ 
+ 	BUILD_BUG_ON((unsigned long)__fix_to_virt(VSYSCALL_PAGE) !=
+ 		     (unsigned long)VSYSCALL_ADDR);
+diff --git a/fs/exec.c b/fs/exec.c
+index 9deb5f4f664b..66de7e77daab 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -2223,3 +2223,55 @@ fs_initcall(init_fs_exec_sysctls);
+ #ifdef CONFIG_EXEC_KUNIT_TEST
+ #include "tests/exec_kunit.c"
+ #endif
++
++#ifdef CONFIG_64BIT
++/*
++ * Kernel cmdline overwrite for CONFIG_SEAL_SYSTEM_MAPPINGS_X
++ */
++enum seal_system_mappings_type {
++	SEAL_SYSTEM_MAPPINGS_NEVER,
++	SEAL_SYSTEM_MAPPINGS_ALWAYS
++};
++
++static enum seal_system_mappings_type seal_system_mappings __ro_after_init =
++	IS_ENABLED(CONFIG_SEAL_SYSTEM_MAPPINGS_ALWAYS) ? SEAL_SYSTEM_MAPPINGS_ALWAYS :
++	SEAL_SYSTEM_MAPPINGS_NEVER;
++
++static const struct constant_table value_table_sys_mapping[] __initconst = {
++	{ "never", SEAL_SYSTEM_MAPPINGS_NEVER},
++	{ "always", SEAL_SYSTEM_MAPPINGS_ALWAYS},
++	{ }
++};
++
++static int __init early_seal_system_mappings_override(char *buf)
++{
++	if (!buf)
++		return -EINVAL;
++
++	seal_system_mappings = lookup_constant(value_table_sys_mapping,
++			buf, seal_system_mappings);
++
++	return 0;
++}
++
++early_param("exec.seal_system_mappings", early_seal_system_mappings_override);
++
++static bool seal_system_mappings_enabled(void)
++{
++	if (seal_system_mappings == SEAL_SYSTEM_MAPPINGS_ALWAYS)
++		return true;
++
++	return false;
++}
++
++void update_seal_exec_system_mappings(unsigned long *vm_flags)
++{
++	if (seal_system_mappings_enabled())
++		*vm_flags |= VM_SEALED;
++
++}
++#else
++void update_seal_exec_system_mappings(unsigned long *vm_flags)
++{
++}
++#endif /* CONFIG_64BIT */
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 1e25267e2e48..fa42d0fce192 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -3075,6 +3075,8 @@ ssize_t __kernel_read(struct file *file, void *buf, size_t count, loff_t *pos);
+ extern ssize_t kernel_write(struct file *, const void *, size_t, loff_t *);
+ extern ssize_t __kernel_write(struct file *, const void *, size_t, loff_t *);
+ extern struct file * open_exec(const char *);
++
++extern void update_seal_exec_system_mappings(unsigned long *vm_flags);
+  
+ /* fs/dcache.c -- generic fs support functions */
+ extern bool is_subdir(struct dentry *, struct dentry *);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index ee8f91eaadb9..ce8876afaf37 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1723,6 +1723,7 @@ static int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 	 * Note: This happens *after* clearing old mappings in some code paths.
+ 	 */
+ 	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
++
+ 	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
+ 		return -ENOMEM;
+ 
+@@ -2115,6 +2116,7 @@ struct vm_area_struct *_install_special_mapping(
+ 	unsigned long addr, unsigned long len,
+ 	unsigned long vm_flags, const struct vm_special_mapping *spec)
+ {
++	update_seal_exec_system_mappings(&vm_flags);
+ 	return __install_special_mapping(mm, addr, len, vm_flags, (void *)spec,
+ 					&special_mapping_vmops);
+ }
+diff --git a/security/Kconfig b/security/Kconfig
+index adc93bb9b88c..3aedfc65872f 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -71,6 +71,30 @@ config SEAL_NX_STACK_ALWAYS
+ 	  Seal NX Stack.
+ endchoice
+ 
++choice
++	prompt "Seal system mappings"
++	default SEAL_SYSTEM_MAPPINGS_NEVER
++	help
++	  Seal system mappings such as vdso, vvar, sigpage, uprobes.
++	  Note: kernel command line exec.seal_system_mappings overwrite this.
++
++config SEAL_SYSTEM_MAPPINGS_NEVER
++	bool "Traditional behavior - not sealed"
++	help
++	  Do not seal system mappings.
++	  This is default.
++
++config SEAL_SYSTEM_MAPPINGS_ALWAYS
++	bool "Always seal system mappings"
++	depends on 64BIT
++	depends on !CHECKPOINT_RESTORE
++	help
++	  Seal system mappings such as vdso, vvar, sigpage, uprobes.
++	  Note: CHECKPOINT_RESTORE might relocate vdso mapping during restore,
++	  and remap will fail if the mapping is sealed, therefore
++	  !CHECKPOINT_RESTORE is added as dependency.
++endchoice
++
+ config SECURITY
+ 	bool "Enable different security models"
+ 	depends on SYSFS
+-- 
+2.46.0.662.g92d0881bb0-goog
+

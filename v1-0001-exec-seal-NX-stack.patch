@@ -1,0 +1,166 @@
+From 29a49925e99d79cedd0a1d8c125d1d3def857366 Mon Sep 17 00:00:00 2001
+From: Jeff Xu <jeffxu@chromium.org>
+Date: Thu, 19 Sep 2024 00:41:29 +0000
+Subject: [RFC PATCH v1 1/2] exec: seal NX stack
+
+seal NX stack during program starts.
+
+Two ways to disable/enable this feature:
+
+KCONFIG: CONFIG_SEAL_NX_STACK_NEVER|ALWAYS
+kernel cmdline: exec.seal_nx_stack=never|always
+
+sealed NX stack can still grow after page-fault.
+
+This will prevent issue such as [1] where NX stack can become
+executable after loading an old shared library.
+
+[1] https://www.qualys.com/2023/07/19/cve-2023-38408/rce-openssh-forwarded-ssh-agent.txt
+
+Signed-off-by: Jeff Xu <jeffxu@chromium.org>
+---
+ .../admin-guide/kernel-parameters.txt         |  8 +++
+ fs/exec.c                                     | 58 ++++++++++++++++++-
+ security/Kconfig                              | 20 +++++++
+ 3 files changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 8dcec6d1cdb8..bc86b6a573f7 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1535,6 +1535,14 @@
+ 			Permit 'security.evm' to be updated regardless of
+ 			current integrity status.
+ 
++	exec.seal_nx_stack = [KNL]
++			Format: { never | always }
++			Seal NX STACK
++			This overwrites KCONFIG CONFIG_SEAL_NX_STACK*
++			- 'never':  never NX Stack.
++			- 'always': always seal NX Stack.
++			If not specified or invalid, default is the KCONFIG value.
++
+ 	early_page_ext [KNL,EARLY] Enforces page_ext initialization to earlier
+ 			stages so cover more early boot allocations.
+ 			Please note that as side effect some optimizations
+diff --git a/fs/exec.c b/fs/exec.c
+index 6c53920795c2..9deb5f4f664b 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -68,7 +68,7 @@
+ #include <linux/user_events.h>
+ #include <linux/rseq.h>
+ #include <linux/ksm.h>
+-
++#include <linux/fs_parser.h>
+ #include <linux/uaccess.h>
+ #include <asm/mmu_context.h>
+ #include <asm/tlb.h>
+@@ -115,6 +115,57 @@ bool path_noexec(const struct path *path)
+ 	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
+ }
+ 
++#ifdef CONFIG_64BIT
++/*
++ * Kernel cmdline overwrite for CONFIG_SEAL_NX_STACK_
++ */
++enum seal_nx_stack_type {
++	SEAL_NX_STACK_NEVER,
++	SEAL_NX_STACK_ALWAYS
++};
++
++static enum seal_nx_stack_type seal_nx_stack __ro_after_init =
++	IS_ENABLED(CONFIG_SEAL_NX_STACK_ALWAYS) ? SEAL_NX_STACK_ALWAYS :
++	SEAL_NX_STACK_NEVER;
++
++static const struct constant_table value_table_nx_stack[] __initconst = {
++	{ "never", SEAL_NX_STACK_NEVER},
++	{ "always", SEAL_NX_STACK_ALWAYS},
++	{ }
++};
++
++static int __init early_seal_nx_stack_override(char *buf)
++{
++	if (!buf)
++		return -EINVAL;
++
++	seal_nx_stack = lookup_constant(value_table_nx_stack,
++			buf, seal_nx_stack);
++
++	return 0;
++}
++
++early_param("exec.seal_nx_stack", early_seal_nx_stack_override);
++
++static inline bool seal_nx_stack_enabled(void)
++{
++	if (seal_nx_stack == SEAL_NX_STACK_ALWAYS)
++		return true;
++
++	return false;
++}
++
++static inline void update_seal_nx_stack(unsigned long *vm_flags)
++{
++	if (seal_nx_stack_enabled())
++		*vm_flags |= VM_SEALED;
++}
++#else
++static inline void update_seal_nx_stack(unsigned long *vm_flags)
++{
++}
++#endif /* CONFIG_64BIT */
++
+ #ifdef CONFIG_USELIB
+ /*
+  * Note that a shared library must be both readable and executable due to
+@@ -779,11 +830,14 @@ int setup_arg_pages(struct linux_binprm *bprm,
+ 	 */
+ 	if (unlikely(executable_stack == EXSTACK_ENABLE_X))
+ 		vm_flags |= VM_EXEC;
+-	else if (executable_stack == EXSTACK_DISABLE_X)
++	else if (executable_stack == EXSTACK_DISABLE_X) {
+ 		vm_flags &= ~VM_EXEC;
++		update_seal_nx_stack(&vm_flags);
++	}
+ 	vm_flags |= mm->def_flags;
+ 	vm_flags |= VM_STACK_INCOMPLETE_SETUP;
+ 
++
+ 	vma_iter_init(&vmi, mm, vma->vm_start);
+ 
+ 	tlb_gather_mmu(&tlb, mm);
+diff --git a/security/Kconfig b/security/Kconfig
+index 28e685f53bd1..adc93bb9b88c 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -51,6 +51,26 @@ config PROC_MEM_NO_FORCE
+ 
+ endchoice
+ 
++choice
++	prompt "Seal NX Stack"
++	default SEAL_NX_STACK_NEVER
++	help
++	  Seal NX STACK so it never become executable.
++	  Note: kernel command line exec.seal_nx_stack overwrites this.
++
++config SEAL_NX_STACK_NEVER
++	bool "Traditional behavior - not sealed"
++	help
++	  Do not NX Stack.
++	  This is default.
++
++config SEAL_NX_STACK_ALWAYS
++	bool "Always seal system mappings"
++	depends on 64BIT
++	help
++	  Seal NX Stack.
++endchoice
++
+ config SECURITY
+ 	bool "Enable different security models"
+ 	depends on SYSFS
+-- 
+2.46.0.662.g92d0881bb0-goog
+
